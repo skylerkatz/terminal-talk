@@ -1,0 +1,215 @@
+#!/bin/bash
+
+# Converse - Simple version without colors for better compatibility
+
+# Configuration
+WHISPER_DIR="$HOME/whisper.cpp"
+MODEL="ggml-large-v3.bin"
+SESSION_FILE="/tmp/claude_conversation_$(date +%Y%m%d_%H%M%S).txt"
+
+# Cleanup function
+cleanup() {
+    echo ""
+    echo "Session saved to: $SESSION_FILE"
+    if [ -f "$TEMP_AUDIO" ]; then
+        rm -f "$TEMP_AUDIO"
+    fi
+    exit 0
+}
+
+trap cleanup EXIT INT TERM
+
+# Record function
+record_segment() {
+    local temp_audio="/tmp/conv_audio_$(date +%s).wav"
+    
+    echo "🎤 Listening... (Press Enter to stop, Ctrl+C to end session)" >&2
+    
+    # Start recording
+    ffmpeg -f avfoundation -i ":0" -ar 16000 -ac 1 "$temp_audio" -y -loglevel warning >&2 &
+    local pid=$!
+    
+    # Wait for Enter key
+    read -r
+    
+    # Stop recording gracefully
+    kill -TERM $pid 2>/dev/null
+    sleep 1  # Give ffmpeg more time to finalize the file
+    kill -KILL $pid 2>/dev/null
+    echo "" >&2
+    wait $pid 2>/dev/null
+    
+    echo "$temp_audio"
+}
+
+# Transcribe function
+transcribe_audio() {
+    local audio_file="$1"
+    local output_file="${audio_file%.wav}"
+    
+    echo "⚡ Processing..." >&2
+    
+    "$WHISPER_DIR/build/bin/whisper-cli" \
+        -m "$WHISPER_DIR/models/$MODEL" \
+        -f "$audio_file" \
+        -otxt \
+        -of "$output_file" \
+        >/dev/null 2>&1
+    
+    local transcript_file="$output_file.txt"
+    
+    if [ -f "$transcript_file" ]; then
+        cat "$transcript_file"
+        rm -f "$transcript_file"
+    fi
+    
+    # Clean up audio immediately
+    rm -f "$audio_file"
+}
+
+# Main conversation loop
+main() {
+    echo "═══════════════════════════════════════"
+    echo "   Claude Voice Conversation Mode"
+    echo "═══════════════════════════════════════"
+    echo ""
+    echo "Instructions:"
+    echo "  • Press Enter to stop recording each segment"
+    echo "  • Type 'copy' to copy entire conversation"
+    echo "  • Type 'clear' to start fresh"
+    echo "  • Type 'exit' or press Ctrl+C to end"
+    echo ""
+    echo "Starting conversation..."
+    echo ""
+    
+    # Initialize session
+    echo "=== Claude Voice Conversation Session ===" > "$SESSION_FILE"
+    echo "Started: $(date)" >> "$SESSION_FILE"
+    echo "" >> "$SESSION_FILE"
+    
+    local segment_count=0
+    local full_conversation=""
+    
+    local first_run=true
+    
+    while true; do
+        # For the first run, auto-start recording
+        if [ "$first_run" = true ]; then
+            first_run=false
+            cmd=""  # Empty command means record
+            echo "────────────────────────────────"
+            echo "[AUTO-START] Starting first recording automatically..."
+        else
+            # Prompt for action
+            echo "────────────────────────────────"
+            printf "[READY] Press Enter to speak, or type command: "
+            read -r cmd
+        fi
+        
+        case "$cmd" in
+            exit|quit|q)
+                echo "Ending conversation..."
+                break
+                ;;
+            copy|c)
+                echo "$full_conversation" | pbcopy
+                echo "✓ Conversation copied to clipboard!"
+                continue
+                ;;
+            clear)
+                full_conversation=""
+                segment_count=0
+                echo "=== Session Cleared ===" >> "$SESSION_FILE"
+                echo "✓ Conversation cleared"
+                continue
+                ;;
+            show|s)
+                echo "Current conversation:"
+                echo "$full_conversation"
+                continue
+                ;;
+            help|h)
+                echo "Commands:"
+                echo "  Enter - Start recording"
+                echo "  copy  - Copy conversation to clipboard"
+                echo "  clear - Clear conversation"
+                echo "  show  - Show current conversation"
+                echo "  exit  - End session"
+                continue
+                ;;
+            "")
+                # Empty input means record
+                ;;
+            *)
+                echo "Unknown command. Type 'help' for commands."
+                continue
+                ;;
+        esac
+        
+        # Record audio segment
+        audio_file=$(record_segment)
+        
+        if [ ! -f "$audio_file" ] || [ ! -s "$audio_file" ]; then
+            echo "✗ Recording failed"
+            continue
+        fi
+        
+        # Transcribe
+        transcript=$(transcribe_audio "$audio_file")
+        
+        if [ -z "$transcript" ]; then
+            echo "✗ Transcription failed"
+            continue
+        fi
+        
+        # Update segment count
+        ((segment_count++))
+        
+        # Format segment
+        segment_header="[Segment $segment_count - $(date +%H:%M:%S)]"
+        
+        # Add to conversation
+        if [ -n "$full_conversation" ]; then
+            full_conversation="$full_conversation
+
+$segment_header
+$transcript"
+        else
+            full_conversation="$segment_header
+$transcript"
+        fi
+        
+        # Save to session file
+        echo "" >> "$SESSION_FILE"
+        echo "$segment_header" >> "$SESSION_FILE"
+        echo "$transcript" >> "$SESSION_FILE"
+        
+        # Display transcription
+        echo "✓ Segment $segment_count transcribed:"
+        echo "$transcript"
+        
+        # Auto-copy latest segment to clipboard
+        echo "$transcript" | pbcopy
+        echo "(Latest segment copied to clipboard)"
+    done
+    
+    # Final copy of entire conversation
+    if [ -n "$full_conversation" ]; then
+        echo "$full_conversation" | pbcopy
+        echo "✓ Full conversation copied to clipboard"
+    fi
+}
+
+# Check prerequisites
+if ! command -v ffmpeg &> /dev/null; then
+    echo "Error: ffmpeg not found. Install with: brew install ffmpeg"
+    exit 1
+fi
+
+if [ ! -f "$WHISPER_DIR/models/$MODEL" ]; then
+    echo "Error: Whisper model not found at $WHISPER_DIR/models/$MODEL"
+    exit 1
+fi
+
+# Run main
+main

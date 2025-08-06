@@ -1,0 +1,301 @@
+#!/bin/bash
+
+# Converse - Continuous voice conversation mode for Claude
+# Records multiple voice inputs in a session
+
+# Configuration
+WHISPER_DIR="$HOME/whisper.cpp"
+MODEL="ggml-large-v3.bin"
+
+# Session management
+RESUME_SESSION=false
+SESSION_FILE=""
+
+# Parse arguments first to determine session file
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -r|--resume)
+            RESUME_SESSION=true
+            shift
+            ;;
+        -h|--help)
+            echo "converse - Claude Voice Conversation Mode"
+            echo ""
+            echo "Usage: converse [options]"
+            echo ""
+            echo "Options:"
+            echo "  -r, --resume   Resume the latest saved session"
+            echo "  -h, --help     Show this help"
+            echo ""
+            echo "Commands during conversation:"
+            echo "  Enter  - Start recording a segment"
+            echo "  copy   - Copy entire conversation to clipboard"
+            echo "  clear  - Clear current conversation"
+            echo "  show   - Show current conversation"  
+            echo "  exit   - End session and save"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use 'converse --help' for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# Determine session file
+if [ "$RESUME_SESSION" = true ]; then
+    # Find the latest session file
+    LATEST_SESSION=$(ls -t /tmp/claude_conversation_*.txt 2>/dev/null | head -1)
+    if [ -z "$LATEST_SESSION" ]; then
+        echo -e "${RED}No previous sessions found in /tmp/${NC}"
+        echo "Starting new session instead..."
+        SESSION_FILE="/tmp/claude_conversation_$(date +%Y%m%d_%H%M%S).txt"
+        RESUME_SESSION=false
+    else
+        SESSION_FILE="$LATEST_SESSION"
+        echo -e "${GREEN}Resuming session: $(basename "$SESSION_FILE")${NC}"
+    fi
+else
+    SESSION_FILE="/tmp/claude_conversation_$(date +%Y%m%d_%H%M%S).txt"
+fi
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+RED='\033[0;31m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Cleanup function
+cleanup() {
+    echo -e "\n${YELLOW}Session saved to: $SESSION_FILE${NC}"
+    if [ -f "$TEMP_AUDIO" ]; then
+        rm -f "$TEMP_AUDIO"
+    fi
+    exit 0
+}
+
+trap cleanup EXIT INT TERM
+
+# Record function
+record_segment() {
+    local temp_audio="/tmp/conv_audio_$(date +%s).wav"
+    
+    echo -e "${CYAN}🎤 Listening...${NC} (${GREEN}Enter${NC} to stop, ${RED}Ctrl+C${NC} to end session)" >&2
+    
+    # Start recording
+    ffmpeg -f avfoundation -i ":0" -ar 16000 -ac 1 "$temp_audio" -y -loglevel warning >&2 &
+    local pid=$!
+    
+    # Wait for Enter key
+    read -r
+    
+    # Stop recording gracefully
+    kill -TERM $pid 2>/dev/null
+    sleep 1  # Give ffmpeg more time to finalize the file
+    kill -KILL $pid 2>/dev/null
+    echo "" >&2
+    wait $pid 2>/dev/null
+    
+    echo "$temp_audio"
+}
+
+# Transcribe function
+transcribe_audio() {
+    local audio_file="$1"
+    local output_file="${audio_file%.wav}"
+    
+    echo -e "${YELLOW}⚡ Processing...${NC}" >&2
+    
+    "$WHISPER_DIR/build/bin/whisper-cli" \
+        -m "$WHISPER_DIR/models/$MODEL" \
+        -f "$audio_file" \
+        -otxt \
+        -of "$output_file" \
+        >/dev/null 2>&1
+    
+    local transcript_file="$output_file.txt"
+    
+    if [ -f "$transcript_file" ]; then
+        cat "$transcript_file"
+        rm -f "$transcript_file"
+    fi
+    
+    # Clean up audio immediately
+    rm -f "$audio_file"
+}
+
+# Main conversation loop
+main() {
+    echo -e "${BOLD}${PURPLE}═══════════════════════════════════════${NC}"
+    echo -e "${BOLD}${PURPLE}   Terminal Talk Conversation Mode${NC}"
+    echo -e "${BOLD}${PURPLE}═══════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${GREEN}Instructions:${NC}"
+    echo -e "  • Press ${GREEN}Enter${NC} to stop recording each segment"
+    echo -e "  • Type '${YELLOW}copy${NC}' to copy entire conversation"
+    echo -e "  • Type '${YELLOW}clear${NC}' to start fresh"
+    echo -e "  • Type '${RED}exit${NC}' or press ${RED}Ctrl+C${NC} to end"
+    echo ""
+    echo -e "${CYAN}Starting conversation...${NC}"
+    echo ""
+    
+    # Initialize or load session
+    local segment_count=0
+    local full_conversation=""
+    
+    if [ "$RESUME_SESSION" = true ] && [ -f "$SESSION_FILE" ]; then
+        # Load existing session
+        echo -e "${YELLOW}Loading previous session...${NC}"
+        
+        # Extract conversation content (skip header lines)
+        full_conversation=$(sed -n '/^=== Claude Voice Conversation Session ===/,$ p' "$SESSION_FILE" | tail -n +4)
+        
+        # Count existing segments
+        segment_count=$(echo "$full_conversation" | grep -c "^\[Segment [0-9]" 2>/dev/null || echo "0")
+        
+        if [ "$segment_count" -gt 0 ]; then
+            echo -e "${GREEN}Loaded $segment_count previous segments${NC}"
+            echo -e "${CYAN}Previous conversation:${NC}"
+            echo "$full_conversation"
+            echo ""
+        fi
+        
+        # Append resume marker to session file
+        echo "" >> "$SESSION_FILE"
+        echo "=== Session Resumed: $(date) ===" >> "$SESSION_FILE"
+        echo "" >> "$SESSION_FILE"
+    else
+        # Create new session
+        echo "=== Claude Voice Conversation Session ===" > "$SESSION_FILE"
+        echo "Started: $(date)" >> "$SESSION_FILE"
+        echo "" >> "$SESSION_FILE"
+    fi
+    
+    local first_run=true
+    
+    while true; do
+        # For the first run, auto-start recording
+        if [ "$first_run" = true ]; then
+            first_run=false
+            cmd=""  # Empty command means record
+            echo -e "${BLUE}────────────────────────────────${NC}"
+            echo -e "${BOLD}[${GREEN}AUTO-START${NC}${BOLD}]${NC} Starting first recording automatically..."
+        else
+            # Prompt for action
+            echo -e "${BLUE}────────────────────────────────${NC}"
+            printf "${BOLD}[${GREEN}READY${NC}${BOLD}]${NC} Press ${GREEN}Enter${NC} to speak, or type command: "
+            read -r cmd
+        fi
+        
+        case "$cmd" in
+            exit|quit|q)
+                echo -e "${RED}Ending conversation...${NC}"
+                break
+                ;;
+            copy|c)
+                echo "$full_conversation" | pbcopy
+                echo -e "${GREEN}✓ Conversation copied to clipboard!${NC}"
+                continue
+                ;;
+            clear)
+                full_conversation=""
+                segment_count=0
+                echo "=== Session Cleared ===" >> "$SESSION_FILE"
+                echo -e "${YELLOW}✓ Conversation cleared${NC}"
+                continue
+                ;;
+            show|s)
+                echo -e "${PURPLE}Current conversation:${NC}"
+                echo "$full_conversation"
+                continue
+                ;;
+            help|h)
+                echo -e "${CYAN}Commands:${NC}"
+                echo "  ${GREEN}Enter${NC} - Start recording"
+                echo "  ${YELLOW}copy${NC}  - Copy conversation to clipboard"
+                echo "  ${YELLOW}clear${NC} - Clear conversation"
+                echo "  ${YELLOW}show${NC}  - Show current conversation"
+                echo "  ${RED}exit${NC}  - End session"
+                continue
+                ;;
+            "")
+                # Empty input means record
+                ;;
+            *)
+                echo -e "${RED}Unknown command. Type 'help' for commands.${NC}"
+                continue
+                ;;
+        esac
+        
+        # Record audio segment
+        audio_file=$(record_segment)
+        
+        if [ ! -f "$audio_file" ] || [ ! -s "$audio_file" ]; then
+            echo -e "${RED}✗ Recording failed${NC}"
+            continue
+        fi
+        
+        # Transcribe
+        transcript=$(transcribe_audio "$audio_file")
+        
+        if [ -z "$transcript" ]; then
+            echo -e "${RED}✗ Transcription failed${NC}"
+            continue
+        fi
+        
+        # Update segment count
+        ((segment_count++))
+        
+        # Format segment
+        segment_header="[Segment $segment_count - $(date +%H:%M:%S)]"
+        
+        # Add to conversation
+        if [ -n "$full_conversation" ]; then
+            full_conversation="$full_conversation
+
+$segment_header
+$transcript"
+        else
+            full_conversation="$segment_header
+$transcript"
+        fi
+        
+        # Save to session file
+        echo "" >> "$SESSION_FILE"
+        echo "$segment_header" >> "$SESSION_FILE"
+        echo "$transcript" >> "$SESSION_FILE"
+        
+        # Display transcription
+        echo -e "${GREEN}✓ Segment $segment_count transcribed:${NC}"
+        echo "$transcript"
+        
+        # Auto-copy latest segment to clipboard
+        echo "$transcript" | pbcopy
+        echo -e "${CYAN}(Latest segment copied to clipboard)${NC}"
+    done
+    
+    # Final copy of entire conversation
+    if [ -n "$full_conversation" ]; then
+        echo "$full_conversation" | pbcopy
+        echo -e "${GREEN}✓ Full conversation copied to clipboard${NC}"
+    fi
+}
+
+# Check prerequisites
+if ! command -v ffmpeg &> /dev/null; then
+    echo -e "${RED}Error: ffmpeg not found. Install with: brew install ffmpeg${NC}"
+    exit 1
+fi
+
+if [ ! -f "$WHISPER_DIR/models/$MODEL" ]; then
+    echo -e "${RED}Error: Whisper model not found at $WHISPER_DIR/models/$MODEL${NC}"
+    exit 1
+fi
+
+# Run main
+main

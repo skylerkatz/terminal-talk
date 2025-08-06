@@ -1,0 +1,160 @@
+#!/bin/bash
+
+# Claude Voice Input - Record, transcribe, and prepare for Claude
+# Automatically cleans up audio files after transcription
+
+# Configuration
+WHISPER_DIR="$HOME/whisper.cpp"
+MODEL="ggml-large-v3.bin"
+TIMESTAMP=$(date +%s)
+TEMP_AUDIO="/tmp/claude_voice_${TIMESTAMP}.wav"
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+# Function to clean up on exit
+cleanup() {
+    # Clean up both audio and transcript files
+    rm -f "$TEMP_AUDIO" "${TEMP_AUDIO%.wav}.txt"
+    if [ ! -z "$FFMPEG_PID" ]; then
+        kill -INT $FFMPEG_PID 2>/dev/null
+    fi
+}
+
+trap cleanup EXIT INT TERM
+
+# Function to record audio
+record() {
+    echo -e "${BLUE}🎤 Recording...${NC} (Press ${GREEN}Enter${NC} to stop)"
+    
+    # Start recording
+    ffmpeg -f avfoundation -i ":0" -ar 16000 -ac 1 "$TEMP_AUDIO" -y -loglevel warning &
+    FFMPEG_PID=$!
+    
+    # Wait for Enter
+    read -r
+    
+    # Stop recording
+    kill -TERM $FFMPEG_PID 2>/dev/null
+    sleep 1
+    kill -KILL $FFMPEG_PID 2>/dev/null
+    wait $FFMPEG_PID 2>/dev/null
+}
+
+# Function to transcribe
+transcribe() {
+    echo -e "${YELLOW}⚡ Transcribing...${NC}" >&2
+    
+    # Use the same base name as the audio file
+    OUTPUT_BASE="${TEMP_AUDIO%.wav}"
+    
+    "$WHISPER_DIR/build/bin/whisper-cli" \
+        -m "$WHISPER_DIR/models/$MODEL" \
+        -f "$TEMP_AUDIO" \
+        -otxt \
+        -of "$OUTPUT_BASE" \
+        >/dev/null 2>&1
+    
+    # Return the expected transcript file path
+    echo "${OUTPUT_BASE}.txt"
+}
+
+# Main execution
+main() {
+    local show_transcript=true
+    local mode="clipboard"
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -q|--quiet)
+                show_transcript=false
+                shift
+                ;;
+            -p|--prompt)
+                mode="prompt"
+                shift
+                ;;
+            -h|--help)
+                echo "claude-voice - Voice input for Claude"
+                echo ""
+                echo "Usage: claude-voice [options]"
+                echo ""
+                echo "Options:"
+                echo "  -q, --quiet    Don't show transcript (just copy)"
+                echo "  -p, --prompt   Add context for Claude"
+                echo "  -h, --help     Show this help"
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Check prerequisites
+    if [ ! -f "$WHISPER_DIR/models/$MODEL" ]; then
+        echo -e "${RED}Error: Model $MODEL not found${NC}"
+        exit 1
+    fi
+    
+    # Record
+    record
+    
+    # Check recording
+    if [ ! -f "$TEMP_AUDIO" ]; then
+        echo -e "${RED}✗ No audio file created${NC}"
+        exit 1
+    fi
+    
+    file_size=$(stat -f%z "$TEMP_AUDIO" 2>/dev/null || stat -c%s "$TEMP_AUDIO" 2>/dev/null)
+    if [ "$file_size" -lt 100 ]; then
+        echo -e "${RED}✗ File too small (${file_size} bytes)${NC}"
+        exit 1
+    fi
+    
+    # Transcribe
+    transcript_file=$(transcribe)
+    
+    # Check transcript (with more debugging)
+    if [ ! -f "$transcript_file" ]; then
+        echo -e "${RED}✗ Transcription failed${NC}"
+        echo "Expected transcript file: $transcript_file"
+        echo "Files in /tmp matching pattern:"
+        ls -la "/tmp/claude_voice_${TIMESTAMP}*" 2>/dev/null || echo "No matching files"
+        exit 1
+    fi
+    
+    # Get content
+    transcript_content=$(cat "$transcript_file")
+    
+    # Format for Claude if needed
+    if [ "$mode" = "prompt" ]; then
+        formatted_text="[Voice input transcribed via Whisper]
+
+$transcript_content"
+    else
+        formatted_text="$transcript_content"
+    fi
+    
+    # Copy to clipboard
+    echo "$formatted_text" | pbcopy
+    
+    # Show result
+    if [ "$show_transcript" = true ]; then
+        echo -e "${GREEN}✓ Transcribed:${NC}"
+        echo "----------------------------------------"
+        echo "$formatted_text"
+        echo "----------------------------------------"
+    fi
+    
+    echo -e "${GREEN}✓ Copied to clipboard!${NC} Ready to paste into Claude"
+}
+
+# Run main function
+main "$@"

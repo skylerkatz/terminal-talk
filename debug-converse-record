@@ -1,0 +1,72 @@
+#!/bin/bash
+
+# Debug the converse recording issue
+
+temp_audio="/tmp/debug_conv_$(date +%s).wav"
+
+echo "Testing converse-style recording..."
+echo "Audio file will be: $temp_audio"
+
+echo "🎤 Recording... (Press Enter to stop)"
+
+# Start recording (exactly like converse does)
+ffmpeg -f avfoundation -i ":0" -ar 16000 -ac 1 "$temp_audio" -y -loglevel warning &
+pid=$!
+
+echo "FFmpeg PID: $pid"
+
+# Wait for Enter
+read -r
+
+echo "Stopping recording..."
+
+# Stop recording (exactly like converse does)  
+kill -TERM $pid 2>/dev/null
+sleep 1
+kill -KILL $pid 2>/dev/null
+echo "Waiting for process..."
+wait $pid 2>/dev/null
+
+echo "Recording stopped."
+
+# Check the file
+if [ -f "$temp_audio" ]; then
+    file_size=$(stat -f%z "$temp_audio")
+    echo "✓ File exists: $temp_audio"
+    echo "✓ File size: $file_size bytes"
+    
+    if [ -s "$temp_audio" ]; then
+        echo "✓ File has content"
+    else
+        echo "✗ File is empty"
+    fi
+    
+    # Test transcription
+    echo "Testing transcription..."
+    output_base="${temp_audio%.wav}"
+    
+    ~/whisper.cpp/build/bin/whisper-cli \
+        -m ~/whisper.cpp/models/ggml-large-v3.bin \
+        -f "$temp_audio" \
+        -otxt \
+        -of "$output_base" \
+        >/dev/null 2>&1
+    
+    transcript_file="$output_base.txt"
+    
+    if [ -f "$transcript_file" ]; then
+        echo "✓ Transcript created:"
+        cat "$transcript_file"
+        rm -f "$transcript_file"
+    else
+        echo "✗ No transcript created"
+    fi
+    
+    # Cleanup
+    rm -f "$temp_audio"
+    echo "✓ Cleaned up"
+else
+    echo "✗ No file created"
+    echo "Files in /tmp:"
+    ls -la /tmp/debug_conv_* 2>/dev/null || echo "No debug files found"
+fi

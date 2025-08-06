@@ -1,0 +1,136 @@
+#!/bin/bash
+
+# Claude Voice Input - Debug Version
+
+# Configuration
+WHISPER_DIR="$HOME/whisper.cpp"
+MODEL="ggml-large-v3.bin"
+TEMP_AUDIO="/tmp/claude_voice_debug_$(date +%s).wav"
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+# Function to clean up on exit
+cleanup() {
+    echo -e "${YELLOW}Debug: Cleaning up...${NC}"
+    if [ -f "$TEMP_AUDIO" ]; then
+        echo "Debug: Removing $TEMP_AUDIO"
+        rm -f "$TEMP_AUDIO"
+    fi
+    if [ ! -z "$FFMPEG_PID" ]; then
+        kill -INT $FFMPEG_PID 2>/dev/null
+    fi
+}
+
+trap cleanup EXIT INT TERM
+
+# Function to record audio
+record() {
+    echo -e "${BLUE}🎤 Recording...${NC} (Press ${GREEN}Enter${NC} to stop)"
+    echo "Debug: Recording to $TEMP_AUDIO"
+    
+    # Start recording in background
+    ffmpeg -f avfoundation -i ":0" -ar 16000 -ac 1 "$TEMP_AUDIO" -y 2>/tmp/ffmpeg_debug.log &
+    FFMPEG_PID=$!
+    echo "Debug: FFmpeg PID: $FFMPEG_PID"
+    
+    # Wait for Enter key
+    read -r
+    
+    # Stop recording
+    echo "Debug: Stopping recording..."
+    kill -INT $FFMPEG_PID 2>/dev/null
+    wait $FFMPEG_PID 2>/dev/null
+    echo "Debug: FFmpeg exit code: $?"
+}
+
+# Function to transcribe
+transcribe() {
+    echo -e "${YELLOW}⚡ Transcribing...${NC}"
+    
+    # Check audio file
+    if [ -f "$TEMP_AUDIO" ]; then
+        echo "Debug: Audio file exists"
+        echo "Debug: Audio file size: $(stat -f%z "$TEMP_AUDIO") bytes"
+        echo "Debug: Audio file info:"
+        ffmpeg -i "$TEMP_AUDIO" 2>&1 | grep -E "Duration|Stream"
+    else
+        echo "Debug: Audio file NOT found!"
+        return 1
+    fi
+    
+    # Transcribe
+    OUTPUT_FILE="${TEMP_AUDIO%.wav}"
+    echo "Debug: Output base: $OUTPUT_FILE"
+    echo "Debug: Running whisper command:"
+    echo "$WHISPER_DIR/build/bin/whisper-cli -m $WHISPER_DIR/models/$MODEL -f $TEMP_AUDIO -otxt -of $OUTPUT_FILE"
+    
+    "$WHISPER_DIR/build/bin/whisper-cli" \
+        -m "$WHISPER_DIR/models/$MODEL" \
+        -f "$TEMP_AUDIO" \
+        -otxt \
+        -of "$OUTPUT_FILE" 2>/tmp/whisper_debug.log
+    
+    WHISPER_EXIT=$?
+    echo "Debug: Whisper exit code: $WHISPER_EXIT"
+    
+    # Check for output
+    TRANSCRIPT_FILE="$OUTPUT_FILE.txt"
+    echo "Debug: Looking for transcript at: $TRANSCRIPT_FILE"
+    
+    if [ -f "$TRANSCRIPT_FILE" ]; then
+        echo "Debug: Transcript file found"
+        echo "Debug: Transcript size: $(stat -f%z "$TRANSCRIPT_FILE") bytes"
+        echo "Debug: Transcript content:"
+        cat "$TRANSCRIPT_FILE"
+        echo "$TRANSCRIPT_FILE"
+    else
+        echo "Debug: Transcript file NOT found"
+        echo "Debug: Whisper log:"
+        cat /tmp/whisper_debug.log 2>/dev/null
+        return 1
+    fi
+}
+
+# Main execution
+echo "Debug: Checking prerequisites..."
+echo "Debug: Whisper dir: $WHISPER_DIR"
+echo "Debug: Model path: $WHISPER_DIR/models/$MODEL"
+
+if [ ! -f "$WHISPER_DIR/models/$MODEL" ]; then
+    echo -e "${RED}Error: Model not found${NC}"
+    exit 1
+else
+    echo "Debug: Model found"
+fi
+
+# Record
+record
+
+# Check recording
+echo "Debug: Checking recording..."
+if [ ! -f "$TEMP_AUDIO" ]; then
+    echo -e "${RED}✗ No audio file created${NC}"
+    echo "Debug: FFmpeg log:"
+    cat /tmp/ffmpeg_debug.log 2>/dev/null
+    exit 1
+fi
+
+if [ ! -s "$TEMP_AUDIO" ]; then
+    echo -e "${RED}✗ Audio file is empty${NC}"
+    exit 1
+fi
+
+# Transcribe
+transcript_file=$(transcribe)
+
+if [ $? -ne 0 ]; then
+    echo -e "${RED}✗ Transcription failed${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}✓ Success!${NC}"

@@ -1,0 +1,71 @@
+#!/bin/bash
+
+# Debug version of cv command
+
+WHISPER_DIR="$HOME/whisper.cpp"
+MODEL="ggml-large-v3.bin"
+TEMP_AUDIO="/tmp/cv_debug_$(date +%s).wav"
+
+echo "🎤 Recording... (Press Enter to stop)"
+
+# Start recording
+ffmpeg -f avfoundation -i ":0" -ar 16000 -ac 1 "$TEMP_AUDIO" -y -loglevel warning &
+FFMPEG_PID=$!
+echo "Started recording with PID: $FFMPEG_PID"
+
+# Wait for Enter
+read -r
+
+# Stop recording
+echo "Stopping recording..."
+kill -TERM $FFMPEG_PID 2>/dev/null
+sleep 1
+kill -KILL $FFMPEG_PID 2>/dev/null
+wait $FFMPEG_PID 2>/dev/null
+
+echo "Recording stopped."
+
+# Check file
+if [ -f "$TEMP_AUDIO" ]; then
+    file_size=$(stat -f%z "$TEMP_AUDIO")
+    echo "File exists: $TEMP_AUDIO"
+    echo "File size: $file_size bytes"
+    
+    if [ "$file_size" -lt 1000 ]; then
+        echo "❌ File too small ($file_size bytes)"
+        echo "FFmpeg might not have had time to write the file properly"
+        
+        # Show what's in the file
+        xxd "$TEMP_AUDIO" | head -5
+        exit 1
+    fi
+    
+    # Try transcription
+    echo "⚡ Transcribing..."
+    OUTPUT_BASE="${TEMP_AUDIO%.wav}"
+    
+    "$WHISPER_DIR/build/bin/whisper-cli" \
+        -m "$WHISPER_DIR/models/$MODEL" \
+        -f "$TEMP_AUDIO" \
+        -otxt \
+        -of "$OUTPUT_BASE"
+    
+    TRANSCRIPT_FILE="$OUTPUT_BASE.txt"
+    
+    if [ -f "$TRANSCRIPT_FILE" ]; then
+        echo "✅ Success!"
+        echo "Transcript:"
+        cat "$TRANSCRIPT_FILE"
+        
+        # Copy to clipboard
+        cat "$TRANSCRIPT_FILE" | pbcopy
+        echo "✅ Copied to clipboard!"
+        
+        # Cleanup
+        rm -f "$TEMP_AUDIO" "$TRANSCRIPT_FILE"
+    else
+        echo "❌ No transcript file created"
+    fi
+else
+    echo "❌ No audio file created"
+fi
